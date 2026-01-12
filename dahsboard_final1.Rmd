@@ -1,0 +1,515 @@
+---
+title: "ISUP DataViz & ML : Risques Climatiques (Hauts-de-Seine)"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    theme:
+      version: 4
+      bootswatch: "cosmo" 
+      bg: "#FFFFFF"
+      fg: "#212529" 
+      primary: "#2780E3"
+    source_code: embed
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+# --- 0. CONFIGURATION DE LA LIBRAIRIE LOCALE ---
+# On s'assure que R utilise les packages installés dans le dossier 'libs'
+if (dir.exists("libs")) {
+  .libPaths(c(normalizePath("libs"), .libPaths()))
+}
+
+# --- 1. CONFIGURATION & PACKAGES ---
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Liste des dépendances nécessaires
+pkgs <- c("shiny", "flexdashboard", "sf", "dplyr", "leaflet", "ggplot2", 
+          "stringr", "randomForest", "vip", "plotly", "scales", "bslib", 
+          "highcharter", "DT", "cluster","tibble", "tidyr")
+
+# Chargement automatique sécurisé
+for (pkg in pkgs) {
+  if (!require(pkg, character.only = TRUE)) {
+    tryCatch({
+      message(paste("Installation du package manquant :", pkg))
+      install.packages(pkg, repos = "https://cloud.r-project.org")
+      library(pkg, character.only = TRUE)
+    }, error = function(e) warning(paste("Impossible d'installer/charger", pkg)))
+  }
+}
+
+# --- 2. FONCTIONS DE TRAITEMENT ---
+
+# Fonction générique de calcul de score (Normalisée 0-10)
+calc_risk <- function(geo_communes, geo_risk, field, weight_fn) {
+  # Standardisation des projections et correction des géométries
+  geo_risk <- st_transform(geo_risk, st_crs(geo_communes)) %>% 
+    st_make_valid()
+  
+  geo_communes <- st_make_valid(geo_communes)
+  
+  # Application des poids selon la classe d'aléa
+  geo_risk$w <- weight_fn(geo_risk[[field]])
+  
+  # Intersection spatiale pour rapporter le risque à la commune
+  # On ignore simplement les erreurs de géométrie si elles persistent après st_make_valid
+  inter <- tryCatch({
+    st_intersection(geo_communes, geo_risk)
+  }, error = function(e) {
+    message("Avertissement : Erreur de géométrie ignorée lors de l'intersection.")
+    return(NULL) # Retourne NULL pour signifier l'échec
+  })
+  
+  if(is.null(inter) || nrow(inter) == 0) return(tibble(code = geo_communes$code, norm = 0))
+  
+  # Calcul du score pondéré par la surface intersectée
+  inter$score_part <- as.numeric(st_area(inter)) * inter$w
+  
+  scores <- inter %>% 
+    st_drop_geometry() %>% 
+    group_by(code) %>% 
+    summarise(total = sum(score_part, na.rm=TRUE))
+  
+  geo_communes$area <- as.numeric(st_area(geo_communes))
+  
+  res <- geo_communes %>% 
+    st_drop_geometry() %>%
+    left_join(scores, by="code") %>%
+    mutate(
+      raw = ifelse(is.na(total), 0, total/area),
+      norm = if(max(raw, na.rm=TRUE) > 0) scales::rescale(raw, to=c(0, 10)) else 0
+    ) %>%
+    select(code, norm)
+  
+  return(res)
+}
+# --- 3. CHARGEMENT ROBUSTE DES DONNÉES ---
+# On cible spécifiquement le département 92 pour ce dashboard
+cache_path <- "communes_scores_92_100pct.rds"
+
+if (file.exists(cache_path)) {
+  # Chargement depuis le cache
+  communes_final <- readRDS(cache_path)
+  
+  # Standardisation des colonnes pour la compatibilité
+  current_cols <- names(communes_final)
+  if ("nomCommune" %in% current_cols && !"nom" %in% current_cols) {
+    communes_final <- communes_final %>% rename(nom = nomCommune)
+  }
+  if ("score_risque_argile" %in% current_cols && !"score_argile" %in% current_cols) {
+    communes_final <- communes_final %>% rename(score_argile = score_risque_argile)
+  }
+  if ("score_risque_nappes" %in% current_cols && !"score_nappes" %in% current_cols) {
+    communes_final <- communes_final %>% rename(score_nappes = score_risque_nappes)
+  }
+} else {
+  # GÉNÉRATION DES DONNÉES (Si cache absent)
+  withProgress(message = "Génération des données pour le 92...", value = 0, {
+    
+    # 1. Communes
+    incProgress(0.1, detail = "Chargement des communes")
+    if(!file.exists("data/communes.geojson")) {
+      download.file("https://raw.githubusercontent.com/gregoiredavid/france-geojson/master/communes.geojson", "data/communes.geojson")
+    }
+    base_communes <- st_read("data/communes.geojson", quiet=TRUE) %>%
+      filter(substr(code, 1, 2) == "92")
+    
+    # 2. Risque Argiles
+    incProgress(0.3, detail = "Calcul risque Argiles")
+    s_argile <- tibble(code=base_communes$code, score_argile=0)
+    if(file.exists("data/AleaRG_Fxx_L93.zip")) {
+       unzip("data/AleaRG_Fxx_L93.zip", exdir="tmp_arg", overwrite=TRUE)
+       shp <- list.files("tmp_arg", pattern=".shp$", full.names=TRUE)[1]
+       if(!is.na(shp)) {
+         sf_arg <- st_read(shp, quiet=TRUE)
+         weight_fn_argile <- function(x) case_when(x=='Fort'~3, x=='Moyen'~2, x=='Faible'~1, TRUE~0)
+         s_argile <- calc_risk(base_communes, sf_arg, "ALEA", weight_fn_argile) %>%
+           rename(score_argile=norm)
+       }
+       unlink("tmp_arg", recursive=TRUE)
+    }
+    
+    # 3. Risque Nappes
+    incProgress(0.6, detail = "Calcul risque Nappes")
+    s_nappe <- tibble(code=base_communes$code, score_nappes=0)
+    # On cherche le zip du 92 dans la structure connue
+    nappe_zip <- "data/Dept/Dept/Dept_92.zip"
+    if(file.exists(nappe_zip)) {
+      unzip(nappe_zip, exdir="tmp_nappe", overwrite=TRUE)
+      shp_n <- list.files("tmp_nappe", pattern="Re_Nappe_fr\\.shp$", full.names=TRUE, recursive=TRUE, ignore.case=TRUE)[1]
+      if(!is.na(shp_n)) {
+        sf_nappe <- st_read(shp_n, quiet=TRUE)
+        weight_fn_nappe <- function(classe) { 
+          case_when(str_detect(classe, "débordements de nappe") ~ 3, 
+                    str_detect(classe, "inondations de cave") ~ 2, 
+                    TRUE ~ 1) 
+        }
+        s_nappe <- calc_risk(base_communes, sf_nappe, "CLASSE", weight_fn_nappe) %>%
+          rename(score_nappes=norm)
+      }
+      unlink("tmp_nappe", recursive=TRUE)
+    }
+    
+    # Fusion finale
+    communes_final <- base_communes %>%
+      left_join(s_argile, by="code") %>%
+      left_join(s_nappe, by="code") %>%
+      mutate(
+        score_argile = tidyr::replace_na(score_argile, 0),
+        score_nappes = tidyr::replace_na(score_nappes, 0),
+        score_global = (score_argile + score_nappes)/2
+      ) %>%
+      st_transform(4326) # Projection pour Leaflet
+    
+    saveRDS(communes_final, cache_path)
+  })
+}
+
+# --- 4. PRÉPARATION DES DONNÉES DVF (ML) ---
+# Priorité au fichier optimisé pour le cloud (créé par prepare_deploy.R)
+dvf_path <- if(file.exists("data/dvf_92_light.csv")) "data/dvf_92_light.csv" else if(file.exists("data/dvf_idf.csv")) "data/dvf_idf.csv" else "data/dvf.csv.gz"
+
+raw_dvf <- tryCatch({
+  # Lecture complète
+  df <- if(grepl(".gz", dvf_path)) read.csv(gzfile(dvf_path)) else read.csv(dvf_path)
+  
+  # Standardisation du code commune
+  if("code_commune" %in% names(df)) df$code <- str_pad(df$code_commune, 5, pad="0")
+  if("id_parcelle" %in% names(df)) df$code <- substr(df$id_parcelle, 1, 5)
+  
+  df %>%
+    filter(substr(code, 1, 2) == "92", 
+           type_local %in% c("Maison", "Appartement"), 
+           valeur_fonciere > 50000, 
+           surface_reelle_bati > 9) %>%
+    mutate(prix_m2 = valeur_fonciere / surface_reelle_bati) %>%
+    filter(prix_m2 < 20000, prix_m2 > 1000) %>%
+    select(code, prix_m2, surface_reelle_bati, type_local, longitude, latitude) %>%
+    na.omit()
+}, error = function(e) tibble())
+
+# Dataset ML fusionné avec les scores
+# Sécurité TYPE : On s'assure que 'code' est bien du texte partout pour éviter le crash du join
+data_ml <- raw_dvf %>%
+  mutate(code = as.character(code)) %>%
+  inner_join(
+    communes_final %>% 
+      st_drop_geometry() %>% 
+      mutate(code = as.character(code)) %>%
+      select(code, nom, score_argile, score_nappes), 
+    by="code"
+  )
+```
+
+Sidebar {.sidebar}
+=====================================
+
+### **Paramètres**
+
+```{r}
+selectInput("dept_choice", "Département :", choices = c("Hauts-de-Seine (92)"), selected = "92")
+
+hr()
+
+h4("Machine Learning")
+sliderInput("sample_n", "Taille Echantillon :", min=500, max=5000, value=1500, step=500)
+actionButton("train_model", "Entraîner Modèle", icon = icon("cogs"), class = "btn-primary btn-block")
+
+hr()
+helpText("Ce dashboard analyse l'impact des risques d'argiles et de nappes phréatiques sur les prix immobiliers dans les Hauts-de-Seine.")
+```
+
+Risque Argiles
+=====================================
+
+Row
+-------------------------------------
+
+### **Carte d'Exposition : Retrait-Gonflement des Argiles**
+
+```{r}
+leafletOutput("map_argile", height = "100%")
+
+output$map_argile <- renderLeaflet({
+  pal <- colorNumeric("Oranges", domain = communes_final$score_argile)
+  
+  leaflet(communes_final) %>%
+    addProviderTiles(providers$CartoDB.Positron) %>%
+    addPolygons(
+      fillColor = ~pal(score_argile), 
+      color = "white", weight = 1, fillOpacity = 0.8,
+      popup = ~paste0("<b>", nom, "</b><br>Risque Argile: ", round(score_argile, 1), "/10")
+    ) %>%
+    addLegend(pal = pal, values = ~score_argile, title = "Indice Argile", position = "bottomright")
+})
+outputOptions(output, "map_argile", suspendWhenHidden = FALSE)
+```
+
+### **Top 10 Communes les plus exposées**
+
+```{r}
+renderHighchart({
+  top10 <- communes_final %>%
+    st_drop_geometry() %>%
+    arrange(desc(score_argile)) %>%
+    head(10)
+  
+  hchart(top10, "bar", hcaes(x = nom, y = score_argile), color = "#e67e22") %>%
+    hc_title(text = "Communes à risque élevé (Argiles)") %>%
+    hc_yAxis(max = 10, title = list(text = "Score / 10"))
+})
+```
+
+Risque Nappes
+=====================================
+
+Row
+-------------------------------------
+
+### **Carte d'Exposition : Remontée de Nappes**
+
+```{r}
+leafletOutput("map_nappes", height = "100%")
+
+output$map_nappes <- renderLeaflet({
+  pal <- colorNumeric("Blues", domain = communes_final$score_nappes)
+  
+  leaflet(communes_final) %>%
+    addProviderTiles(providers$CartoDB.Positron) %>%
+    addPolygons(
+      fillColor = ~pal(score_nappes), 
+      color = "white", weight = 1, fillOpacity = 0.8,
+      popup = ~paste0("<b>", nom, "</b><br>Risque Nappes: ", round(score_nappes, 1), "/10")
+    ) %>%
+    addLegend(pal = pal, values = ~score_nappes, title = "Indice Nappes", position = "bottomright")
+})
+outputOptions(output, "map_nappes", suspendWhenHidden = FALSE)
+```
+
+### **Top 10 Communes les plus exposées**
+
+```{r}
+renderHighchart({
+  top10 <- communes_final %>%
+    st_drop_geometry() %>%
+    arrange(desc(score_nappes)) %>%
+    head(10)
+  
+  hchart(top10, "bar", hcaes(x = nom, y = score_nappes), color = "#3498db") %>%
+    hc_title(text = "Communes à risque élevé (Nappes)") %>%
+    hc_yAxis(max = 10, title = list(text = "Score / 10"))
+})
+```
+
+ML Supervisé (Prix)
+=====================================
+
+Row
+-------------------------------------
+
+### **Configuration & Performance**
+
+```{r}
+# Logique ML Réactive
+ml_res <- eventReactive(input$train_model, {
+  req(data_ml)
+  if(nrow(data_ml) < 50) return(NULL)
+  
+  withProgress(message = "Apprentissage...", {
+    
+    # 1. Préparation des données
+    df <- data_ml %>%
+      select(prix_m2, surface_reelle_bati, type_local, longitude, latitude, score_argile, score_nappes) %>%
+      sample_n(min(nrow(.), input$sample_n)) %>%
+      as.data.frame() # Conversion explicite pour randomForest
+    
+    # 2. Split Train/Test (70/30)
+    idx <- sample(1:nrow(df), floor(0.7*nrow(df)))
+    train <- df[idx,]
+    test <- df[-idx,]
+    
+    # 3. Entraînement Random Forest
+    rf <- randomForest(prix_m2 ~ ., data=train, ntree=100, importance=TRUE, na.action=na.omit)
+    
+    # 4. Métriques
+    pred <- predict(rf, test)
+    r2 <- 1 - sum((test$prix_m2 - pred)^2) / sum((test$prix_m2 - mean(test$prix_m2))^2)
+    rmse <- sqrt(mean((test$prix_m2 - pred)^2))
+    
+    list(model=rf, r2=r2, rmse=rmse, importance=vip::vi(rf), test=test, pred=pred)
+  })
+})
+
+renderUI({
+  res <- ml_res()
+  if(is.null(res)) {
+    if(nrow(data_ml) < 50) return(HTML("<div class='alert alert-danger'>Pas assez de données DVF pour le 92 dans l'échantillon lu.</div>"))
+    return(HTML("<i>Cliquez sur 'Entraîner Modèle' pour lancer l'analyse.</i>"))
+  }
+  
+  tagList(
+    valueBox(paste0(round(res$r2*100, 1), "% "), "R-Squared (Qualité)", icon = "fa-check", color = "success"),
+    valueBox(paste0(round(res$rmse, 0), " € "), "Erreur Moyenne (RMSE)", icon = "fa-exclamation", color = "warning")
+  )
+})
+```
+
+### **Feature Importance : Qu'est-ce qui fait le prix ?**
+
+```{r}
+renderPlot({
+  res <- ml_res()
+  req(res)
+  
+  vip::vip(res$model, geom = "col", mapping = aes(fill = Variable)) + 
+    theme_minimal() + 
+    labs(title = "Importance des Variables (Random Forest)")
+})
+```
+
+Row
+-------------------------------------
+
+### **Partial Dependence Plot (PDP) : Effet du Risque Argile**
+
+```{r}
+renderPlot({
+  res <- ml_res()
+  req(res)
+  
+  partialPlot(res$model, as.data.frame(res$test), x.var = "score_argile", 
+              main = "Impact Marginal : Score Argile vs Prix",
+              xlab = "Score Argile (0 à 10)", ylab = "Prix m² Ajusté",
+              lwd = 3, col = "#e67e22")
+  grid()
+})
+```
+
+### **Partial Dependence Plot (PDP) : Effet du Risque Nappes**
+
+```{r}
+renderPlot({
+  res <- ml_res()
+  req(res)
+  
+  partialPlot(res$model, as.data.frame(res$test), x.var = "score_nappes", 
+              main = "Impact Marginal : Score Nappes vs Prix",
+              xlab = "Score Nappes (0 à 10)", ylab = "Prix m² Ajusté",
+              lwd = 3, col = "#3498db")
+  grid()
+})
+```
+
+ML Non-Supervisé (Bonus)
+=====================================
+
+Row
+-------------------------------------
+
+### **Clustering des Communes (K-Means)**
+
+```{r}
+# Logique de Clustering
+cluster_data <- reactive({
+  req(communes_final, data_ml)
+  
+  # Check sécurité
+  if(nrow(data_ml) < 10) return(NULL)
+  
+  # Agrégation des statistiques par commune
+  stats <- data_ml %>%
+    group_by(nom) %>%
+    summarise(
+      prix_moy = mean(prix_m2, na.rm=TRUE),
+      surf_moy = mean(surface_reelle_bati, na.rm=TRUE)
+    )
+  
+  # Jointure avec les risques
+  df_c <- communes_final %>% 
+    st_drop_geometry() %>%
+    select(nom, score_argile, score_nappes) %>%
+    inner_join(stats, by="nom") %>%
+    column_to_rownames("nom")
+  
+  # Sécurité K-Means : Suppression des colonnes constantes (écart-type nul)
+  # scale() produit des NaN si sd=0
+  df_c_clean <- df_c %>% select(where(~ is.numeric(.) && sd(.) > 1e-6))
+  
+  if(ncol(df_c_clean) < 2) return(NULL) # Pas assez de variables pour cluster
+  if(nrow(df_c_clean) < 3) return(NULL)
+  
+  # K-means sur données centrées-réduites
+  set.seed(42)
+  km <- kmeans(scale(df_c_clean), centers = min(3, nrow(df_c_clean)-1))
+  
+  # On rajoute le cluster au dataframe complet (même si certaines col ont sauté)
+  df_c$Cluster <- as.factor(km$cluster)
+  
+  list(data=df_c, model=km, data_pca=df_c_clean)
+})
+
+renderPlotly({
+  res <- cluster_data()
+  if(is.null(res)) return(plot_ly() %>% layout(title = "Données insuffisantes pour le clustering (variance nulle ou pas assez de communes)"))
+  
+  # Analyse en Composantes Principales (PCA) sur les variables nettoyées
+  pca <- prcomp(res$data_pca, scale. = TRUE)
+  pca_df <- as.data.frame(pca$x)
+  # On s'assure que les indices correspondent (rownames)
+  pca_df$Cluster <- res$data$Cluster[match(rownames(pca_df), rownames(res$data))]
+  pca_df$Nom <- rownames(pca_df)
+  
+  plot_ly(pca_df, x = ~PC1, y = ~PC2, color = ~Cluster, text = ~Nom, 
+          type = "scatter", mode = "markers", marker = list(size = 12)) %>%
+    layout(title = "Typologie des Communes (Projection PCA)",
+           xaxis = list(title = "PC1 (Dimension Principale)"),
+           yaxis = list(title = "PC2"))
+})
+```
+
+### **Profil des Clusters**
+
+```{r}
+renderTable({
+  res <- cluster_data()
+  if(is.null(res)) return(data.frame(Message="Pas assez de données"))
+  
+  res$data %>%
+    group_by(Cluster) %>%
+    summarise(
+      Nb_Communes = n(),
+      Prix_Moyen = mean(prix_moy),
+      Risque_Argile = mean(score_argile),
+      Risque_Nappes = mean(score_nappes)
+    )
+}, digits = 1)
+```
+
+Row
+-------------------------------------
+
+### **Distribution Géographique des Clusters**
+
+```{r}
+renderLeaflet({
+  res <- cluster_data()
+  if(is.null(res)) return(leaflet() %>% addTiles())
+  
+  # Jointure pour affichage cartographique
+  map_c <- communes_final %>%
+    left_join(res$data %>% rownames_to_column("nom") %>% select(nom, Cluster), by="nom") %>%
+    filter(!is.na(Cluster))
+  
+  pal <- colorFactor(palette = "Set1", domain = map_c$Cluster)
+  
+  leaflet(map_c) %>%
+    addProviderTiles(providers$CartoDB.Positron) %>%
+    addPolygons(
+      fillColor = ~pal(Cluster), stroke = TRUE, color = "white", weight = 1, fillOpacity = 0.7,
+      popup = ~paste0("<b>", nom, "</b><br>Cluster: ", Cluster)
+    ) %>%
+    addLegend(pal = pal, values = ~Cluster, title = "Typologie (Cluster)", position = "bottomright")
+})
+```

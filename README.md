@@ -5,9 +5,15 @@
 
 Ce projet analyse la corrélation entre les prix de l'immobilier et les risques naturels (Retrait-Gonflement des Argiles et Remontée de Nappes Phréatiques) dans le département du 92.
 
+Les données sont disponibles ici : 
+
+https://www.data.gouv.fr/datasets/demandes-de-valeurs-foncieres-geolocalisees
+https://www.georisques.gouv.fr/donnees/bases-de-donnees/retrait-gonflement-des-argiles
+https://www.georisques.gouv.fr/donnees/bases-de-donnees/inondations-par-remontee-de-nappes
+
 ## Accès Rapide (Démo en ligne)
 
-L'application est déployée et accessible directement via ce lien :
+L'application est déployée et accessible directement via ce lien : (Refresh ou F5 si les cartes sont bugées)
 👉 **[Voir le Dashboard Interactif](https://nathangautron.shinyapps.io/Datavis_GAUTRON_GOUSSET_LAFAYE/)**
 
 ---

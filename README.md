@@ -11,10 +11,18 @@ https://www.data.gouv.fr/datasets/demandes-de-valeurs-foncieres-geolocalisees
 https://www.georisques.gouv.fr/donnees/bases-de-donnees/retrait-gonflement-des-argiles
 https://www.georisques.gouv.fr/donnees/bases-de-donnees/inondations-par-remontee-de-nappes
 
-## Accès Rapide (Démo en ligne)
+## Rapport de projet - HTML
+
+Dézipper markdown_dataviz_html.zip
+
+## Accès Rapide (Démo en ligne) - Le Dashboard (Appli ShinnyApps)
 
 L'application est déployée et accessible directement via ce lien : (Refresh ou F5 si les cartes sont bugées)
 👉 **[Voir le Dashboard Interactif](https://nathangautron.shinyapps.io/Datavis_GAUTRON_GOUSSET_LAFAYE/)**
+
+## La Présentation - Slides
+
+presentation_data_viz.pdf
 
 ---
 
